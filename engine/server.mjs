@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { spawn, execSync } from 'node:child_process';
+import { spawn, exec } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
@@ -16,9 +16,9 @@ const MODELS_DIR = path.resolve(__dirname, '..', 'models');
 const LLAMA_EXE = path.join(BIN_DIR, 'llama-server.exe');
 const MODEL_FILE = path.join(MODELS_DIR, 'qwen2.5-3b-instruct-q4_k_m.gguf');
 
-// ==========================================
-// 1. Vocabulary & Guardrail Definitions
-// ==========================================
+// Cache model existence check
+let cachedModelFileExists = fs.existsSync(MODEL_FILE);
+
 const COMMON_TECH_WORDS = [
   'Ctrl', 'Control', 'Alt', 'Shift', 'Cmd', 'Command', 'Win', 'hotkey', 'hotkeys',
   'shortcut', 'shortcuts', 'wording', 'prompting', 'quantized', 'quantization',
@@ -30,7 +30,6 @@ const COMMON_TECH_WORDS = [
   'async', 'sync', 'taskbar', 'popup', 'minimalist', 'keybd', 'pywebview'
 ];
 
-// Patterns that must NEVER be mutated or flagged as spelling errors
 const PROTECTED_PATTERNS = [
   /\b(?:Ctrl|Control|Alt|Shift|Cmd|Command|Win|Windows|Meta|Option)\+(?:[A-Za-z0-9+]|\b[A-Za-z0-9]+\b)+/gi,
   /\b[\w-]+\.(?:exe|mjs|js|py|json|md|txt|html|css|png|ico|zip|gguf)\b/gi,
@@ -38,47 +37,52 @@ const PROTECTED_PATTERNS = [
   /\b[A-Z0-9_]{3,}\b/g
 ];
 
+// ==========================================
+// 1. Harper WASM Manager (with init lock)
+// ==========================================
 class HarperManager {
   constructor() {
     this.linter = null;
     this.ready = false;
-    this.initError = null;
+    this.initPromise = null;
   }
 
   async init() {
-    if (this.ready) return;
-    try {
-      const { LocalLinter, Dialect } = await import('harper.js');
-      const { binaryInlined } = await import('harper.js/binaryInlined');
-      this.linter = new LocalLinter({ binary: binaryInlined, dialect: Dialect.American });
-      await this.linter.setup();
+    if (this.ready) return true;
+    if (this.initPromise) return this.initPromise;
 
-      // Import technical and domain vocabulary to prevent false spelling flags
-      if (typeof this.linter.importWords === 'function') {
-        await this.linter.importWords(COMMON_TECH_WORDS);
+    this.initPromise = (async () => {
+      try {
+        const { LocalLinter, Dialect } = await import('harper.js');
+        const { binaryInlined } = await import('harper.js/binaryInlined');
+        this.linter = new LocalLinter({ binary: binaryInlined, dialect: Dialect.American });
+        await this.linter.setup();
+
+        if (typeof this.linter.importWords === 'function') {
+          await this.linter.importWords(COMMON_TECH_WORDS);
+        }
+
+        this.ready = true;
+        console.log('[Harper] Grammar engine initialized with extended technical vocabulary.');
+        return true;
+      } catch (err) {
+        console.error('[Harper] Failed to initialize:', err);
+        this.ready = false;
+        throw err;
+      } finally {
+        this.initPromise = null;
       }
+    })();
 
-      this.ready = true;
-      this.initError = null;
-      console.log('[Harper] Grammar engine initialized with extended technical vocabulary.');
-    } catch (err) {
-      this.initError = err;
-      console.error('[Harper] Failed to initialize:', err.message);
-    }
+    return this.initPromise;
   }
 
   async check(text) {
-    if (!this.ready) {
-      await this.init();
-    }
-    if (!this.ready || !this.linter) {
-      throw new Error(`Harper grammar engine unavailable: ${this.initError?.message || 'Not initialized'}`);
-    }
+    if (!this.ready) await this.init();
     if (!text || text.trim().length === 0) {
       return { text: '', lints: [], correctedText: '' };
     }
 
-    // Identify protected ranges (shortcuts like Ctrl+Alt+W, filenames, URLs)
     const protectedRanges = [];
     for (const pattern of PROTECTED_PATTERNS) {
       let match;
@@ -95,18 +99,13 @@ class HarperManager {
       const span = item.span();
       const problem = item.get_problem_text();
 
-      // Check if this lint falls inside or overlaps with a protected range
+      // Overlap check
       const isProtected = protectedRanges.some(r =>
-        (span.start >= r.start && span.end <= r.end) ||
-        (r.start >= span.start && r.end <= span.end)
+        span.start < r.end && span.end > r.start
       );
 
-      // Do not allow single letters in shortcuts to be converted to words (e.g. W -> We)
-      if (isProtected) {
-        continue;
-      }
+      if (isProtected) continue;
 
-      // Skip stylistic suggestions that complain about informal "Ctrl"
       if (problem.toLowerCase() === 'ctrl' && item.message().toLowerCase().includes('informal')) {
         continue;
       }
@@ -122,7 +121,6 @@ class HarperManager {
       });
     }
 
-    // Auto-fix: replace from highest index to lowest so spans remain aligned
     let correctedText = text;
     const sorted = [...lints].sort((a, b) => b.start - a.start);
     for (const lint of sorted) {
@@ -136,7 +134,7 @@ class HarperManager {
 }
 
 // ==========================================
-// 2. llama.cpp Lifecycle Manager
+// 2. llama.cpp Lifecycle Manager (Safe Concurrency)
 // ==========================================
 class LlamaManager {
   constructor() {
@@ -148,36 +146,42 @@ class LlamaManager {
     this.activeRequests = 0;
   }
 
-  resetIdleTimer() {
+  clearIdleTimer() {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
     }
-    this.lastActiveTime = Date.now();
-    // Only schedule unload if there are no active inference requests
-    if (this.activeRequests === 0) {
-      this.idleTimer = setTimeout(() => {
-        if (this.activeRequests === 0) {
-          console.log(`[LLM] 60s idle threshold reached. Unloading model to reclaim RAM...`);
-          this.unload();
-        }
-      }, IDLE_TIMEOUT_MS);
+  }
+
+  armIdleTimer() {
+    this.clearIdleTimer();
+    // Only arm idle timer if engine is ready and no active requests are running
+    if (this.state !== 'ready' || this.activeRequests > 0 || !this.process) {
+      return;
     }
+    this.lastActiveTime = Date.now();
+    this.idleTimer = setTimeout(() => {
+      console.log('[LLM] 60s idle threshold reached. Unloading model to reclaim RAM...');
+      this.unload();
+    }, IDLE_TIMEOUT_MS);
   }
 
   async ensureReady() {
-    this.resetIdleTimer();
-    if (this.state === 'ready' || this.state === 'processing') {
+    if ((this.state === 'ready' || this.state === 'processing') && this.process) {
       return true;
     }
     if (this.loadingPromise) {
-      return this.loadingPromise;
+      await this.loadingPromise;
+      return true;
     }
 
     this.loadingPromise = this._startServer();
     try {
       await this.loadingPromise;
       return true;
+    } catch (err) {
+      this.state = 'unloaded';
+      throw err;
     } finally {
       this.loadingPromise = null;
     }
@@ -185,16 +189,15 @@ class LlamaManager {
 
   async _startServer() {
     if (!fs.existsSync(LLAMA_EXE)) {
-      throw new Error(`llama-server executable not found at ${LLAMA_EXE}. Run setup to download binaries.`);
+      throw new Error(`llama-server executable not found at ${LLAMA_EXE}`);
     }
-    if (!fs.existsSync(MODEL_FILE)) {
-      throw new Error(`Model file not found at ${MODEL_FILE}. Please download the GGUF model.`);
+    cachedModelFileExists = fs.existsSync(MODEL_FILE);
+    if (!cachedModelFileExists) {
+      throw new Error(`Model file not found at ${MODEL_FILE}. Please download the model.`);
     }
-
-    // Clean up any stale orphaned server process on the port before launching
-    this._cleanStaleProcess();
 
     this.state = 'loading';
+    this.clearIdleTimer();
     console.log(`[LLM] Launching llama-server.exe for model: ${MODEL_FILE}...`);
 
     const args = [
@@ -206,47 +209,47 @@ class LlamaManager {
       '--log-disable'
     ];
 
-    this.process = spawn(LLAMA_EXE, args, {
+    const currentProcess = spawn(LLAMA_EXE, args, {
       stdio: 'ignore',
       detached: false,
       windowsHide: true
     });
+    this.process = currentProcess;
 
-    const currentProcess = this.process;
-
+    let hasExited = false;
     currentProcess.on('error', (err) => {
       console.error('[LLM] Server spawn error:', err);
       if (this.process === currentProcess) {
         this.state = 'unloaded';
         this.process = null;
       }
+      hasExited = true;
     });
 
     currentProcess.on('exit', (code, signal) => {
-      console.log(`[LLM] llama-server exited (code: ${code}, signal: ${signal})`);
+      console.log(`[LLM] llama-server exited with code ${code}, signal ${signal}`);
       if (this.process === currentProcess) {
         this.state = 'unloaded';
         this.process = null;
-        if (this.idleTimer) {
-          clearTimeout(this.idleTimer);
-          this.idleTimer = null;
-        }
       }
+      hasExited = true;
+      this.clearIdleTimer();
     });
 
-    // Poll health endpoint until responsive (max 45 seconds)
+    // Poll health endpoint with process liveliness check (max 45 seconds)
     const startTime = Date.now();
     while (Date.now() - startTime < 45000) {
-      if (this.state === 'unloaded' || !this.process) {
+      if (hasExited || this.process !== currentProcess) {
+        this.unload();
         throw new Error('llama-server process exited unexpectedly during startup');
       }
 
       await new Promise(r => setTimeout(r, 600));
       try {
-        const resp = await fetch(`http://127.0.0.1:${LLAMA_PORT}/health`, { signal: AbortSignal.timeout(1500) });
-        if (resp.ok) {
+        const resp = await fetch(`http://127.0.0.1:${LLAMA_PORT}/health`);
+        if (resp.ok && !hasExited) {
           this.state = 'ready';
-          this.resetIdleTimer();
+          this.armIdleTimer();
           console.log(`[LLM] Model is loaded and ready in ${((Date.now() - startTime) / 1000).toFixed(1)}s!`);
           return;
         }
@@ -259,36 +262,26 @@ class LlamaManager {
     throw new Error('llama-server startup timed out after 45s');
   }
 
-  _cleanStaleProcess() {
-    try {
-      if (process.platform === 'win32') {
-        execSync(`taskkill /f /im llama-server.exe`, { stdio: 'ignore' });
-      }
-    } catch {
-      // No stale process running
-    }
-  }
-
   unload() {
-    if (this.idleTimer) {
-      clearTimeout(this.idleTimer);
-      this.idleTimer = null;
-    }
-    if (this.process) {
-      const pid = this.process.pid;
+    this.clearIdleTimer();
+    const proc = this.process;
+    this.process = null;
+    this.state = 'unloaded';
+
+    if (proc) {
+      const pid = proc.pid;
       console.log(`[LLM] Terminating llama-server (PID: ${pid})...`);
       try {
-        if (process.platform === 'win32') {
-          execSync(`taskkill /pid ${pid} /t /f`, { stdio: 'ignore' });
+        proc.removeAllListeners();
+        if (process.platform === 'win32' && pid) {
+          exec(`taskkill /pid ${pid} /t /f`, () => {});
         } else {
-          this.process.kill('SIGTERM');
+          proc.kill('SIGTERM');
         }
       } catch (err) {
-        // Already closed
+        // Already closed or access
       }
-      this.process = null;
     }
-    this.state = 'unloaded';
     console.log('[LLM] Model unloaded. RAM reclaimed.');
   }
 
@@ -296,7 +289,7 @@ class LlamaManager {
     await this.ensureReady();
     this.activeRequests++;
     this.state = 'processing';
-    this.resetIdleTimer();
+    this.clearIdleTimer();
 
     try {
       const payload = {
@@ -313,29 +306,29 @@ class LlamaManager {
       const response = await fetch(`http://127.0.0.1:${LLAMA_PORT}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(60000)
+        body: JSON.stringify(payload)
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`LLM API returned status ${response.status}: ${errorText}`);
+        throw new Error(`LLM API returned status ${response.status}: ${await response.text()}`);
       }
 
       const data = await response.json();
-      const rawOutput = data.choices?.[0]?.message?.content || '';
-      return rawOutput.trim();
+      return (data.choices?.[0]?.message?.content || '').trim();
     } finally {
       this.activeRequests = Math.max(0, this.activeRequests - 1);
-      if (this.activeRequests === 0) {
-        this.state = 'ready';
-        this.resetIdleTimer();
+      // Only set to ready and arm idle timer if engine was not unloaded
+      if (this.process && this.state !== 'unloaded') {
+        if (this.activeRequests === 0) {
+          this.state = 'ready';
+          this.armIdleTimer();
+        }
       }
     }
   }
 
   getStatus() {
-    const idleSecondsLeft = this.state === 'ready' && this.lastActiveTime && this.activeRequests === 0
+    const idleSecondsLeft = (this.state === 'ready' && this.lastActiveTime && this.process)
       ? Math.max(0, Math.round((IDLE_TIMEOUT_MS - (Date.now() - this.lastActiveTime)) / 1000))
       : 0;
 
@@ -343,15 +336,15 @@ class LlamaManager {
       state: this.state,
       idleSecondsLeft,
       activeRequests: this.activeRequests,
-      modelLoaded: this.state === 'ready' || this.state === 'processing',
-      modelFileExists: fs.existsSync(MODEL_FILE),
+      modelLoaded: (this.state === 'ready' || this.state === 'processing') && Boolean(this.process),
+      modelFileExists: cachedModelFileExists,
       binExists: fs.existsSync(LLAMA_EXE)
     };
   }
 }
 
 // ==========================================
-// 3. System Prompts
+// 3. System Prompts & Word-Level Diffing
 // ==========================================
 const PROMPT_GRAMMAR = `You are an elite, contextual grammar and spell checker.
 Your sole job is to fix all spelling errors, contextual typos, capitalization flaws, grammatical mistakes, and punctuation errors while strictly preserving the author's original meaning, voice, intent, formatting, and technical terms.
@@ -426,26 +419,39 @@ function extractWordDiffs(original, corrected) {
 
   const lints = [];
   let i = 0, j = 0;
+
   while (i < origTokens.length && j < corrTokens.length) {
     const o = origTokens[i];
     const c = corrTokens[j];
 
+    if (o === c) {
+      i++; j++;
+      continue;
+    }
+
     const oClean = o.replace(/^[^\w]+|[^\w]+$/g, '');
     const cClean = c.replace(/^[^\w]+|[^\w]+$/g, '');
 
-    if (o === c) {
-      i++; j++;
-    } else if (oClean && cClean && oClean.toLowerCase() === cClean.toLowerCase()) {
-      if (oClean !== cClean) {
+    // Case 1: Same base word (differ by punctuation or capitalization)
+    if (oClean && cClean && oClean.toLowerCase() === cClean.toLowerCase()) {
+      if (oClean === cClean && o !== c) {
         lints.push({
-          problemText: oClean || o,
-          suggestions: [cClean || c],
+          problemText: o,
+          suggestions: [c],
+          kind: 'Punctuation',
+          message: `Update punctuation: '${o}' to '${c}'`
+        });
+      } else if (oClean !== cClean) {
+        lints.push({
+          problemText: o,
+          suggestions: [c],
           kind: 'Capitalization',
-          message: `Change case of '${oClean || o}' to '${cClean || c}'`
+          message: `Change case of '${o}' to '${c}'`
         });
       }
       i++; j++;
     } else {
+      // Lookahead 1 word
       if (i + 1 < origTokens.length && origTokens[i + 1] === c) {
         lints.push({
           problemText: o,
@@ -459,7 +465,7 @@ function extractWordDiffs(original, corrected) {
           problemText: o,
           suggestions: [c + ' ' + o],
           kind: 'Grammar',
-          message: `Insert '${c}' before '${o}'`
+          message: `Insert '${c}'`
         });
         j++;
       } else {
@@ -474,6 +480,28 @@ function extractWordDiffs(original, corrected) {
     }
   }
 
+  // Trailing removals in original text
+  while (i < origTokens.length) {
+    lints.push({
+      problemText: origTokens[i],
+      suggestions: [''],
+      kind: 'Grammar',
+      message: `Remove '${origTokens[i]}'`
+    });
+    i++;
+  }
+
+  // Trailing additions in corrected text
+  while (j < corrTokens.length) {
+    lints.push({
+      problemText: origTokens[origTokens.length - 1] || '',
+      suggestions: [corrTokens[j]],
+      kind: 'Grammar',
+      message: `Append '${corrTokens[j]}'`
+    });
+    j++;
+  }
+
   const seen = new Set();
   return lints.filter(l => {
     const key = `${l.problemText}::${l.suggestions[0]}`;
@@ -484,15 +512,17 @@ function extractWordDiffs(original, corrected) {
 }
 
 // ==========================================
-// 4. HTTP Server & Route Handling
+// 4. HTTP Server & Request Handling
 // ==========================================
 const harper = new HarperManager();
 const llama = new LlamaManager();
 
-// Pre-init Harper in background
-harper.init().catch(err => console.warn('[Harper] Warmup deferred:', err.message));
+harper.init().catch(err => {
+  console.warn('[Harper] Background initialization deferred:', err.message);
+});
 
 function sendJson(res, statusCode, data) {
+  if (res.headersSent) return;
   res.writeHead(statusCode, {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
@@ -504,27 +534,51 @@ function sendJson(res, statusCode, data) {
 
 function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk;
-      if (body.length > 2 * 1024 * 1024) {
+    const chunks = [];
+    let length = 0;
+    const MAX_SIZE = 2 * 1024 * 1024;
+
+    const onData = chunk => {
+      chunks.push(chunk);
+      length += chunk.length;
+      if (length > MAX_SIZE) {
+        cleanup();
         req.destroy();
-        reject(new Error('Payload too large (maximum 2MB allowed)'));
+        const err = new Error('Payload too large (maximum 2MB)');
+        err.statusCode = 413;
+        reject(err);
       }
-    });
-    req.on('end', () => {
+    };
+
+    const onEnd = () => {
+      cleanup();
       try {
-        resolve(body ? JSON.parse(body) : {});
+        const raw = Buffer.concat(chunks).toString('utf-8');
+        resolve(raw.trim() ? JSON.parse(raw) : {});
       } catch (err) {
-        reject(new Error(`Invalid JSON body: ${err.message}`));
+        err.statusCode = 400;
+        reject(err);
       }
-    });
-    req.on('error', reject);
+    };
+
+    const onError = err => {
+      cleanup();
+      reject(err);
+    };
+
+    function cleanup() {
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+    }
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
   });
 }
 
 const server = http.createServer(async (req, res) => {
-  // CORS Preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -535,8 +589,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
-  const pathname = url.pathname;
+  const host = req.headers.host || `127.0.0.1:${PORT}`;
+  let pathname;
+  try {
+    const url = new URL(req.url, `http://${host}`);
+    pathname = url.pathname;
+  } catch (err) {
+    return sendJson(res, 400, { error: 'Invalid URL' });
+  }
 
   try {
     if (req.method === 'GET' && (pathname === '/health' || pathname === '/status')) {
@@ -553,7 +613,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/shutdown') {
-      sendJson(res, 200, { success: true, message: 'Engine shutting down' });
+      sendJson(res, 200, { success: true, message: 'Shutting down engine service' });
       setImmediate(gracefulShutdown);
       return;
     }
@@ -565,23 +625,23 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Try LLM check first if model exists, fallback to Harper WASM
-      if (fs.existsSync(LLAMA_EXE) && fs.existsSync(MODEL_FILE)) {
+      if (fs.existsSync(LLAMA_EXE) && cachedModelFileExists) {
         try {
           const corrected = await llama.generate(PROMPT_GRAMMAR, text);
           const lints = extractWordDiffs(text, corrected);
-          return sendJson(res, 200, {
-            text,
-            correctedText: corrected,
-            lints,
-            engine: 'llama'
-          });
+          return sendJson(res, 200, { text, correctedText: corrected, lints, engine: 'llama' });
         } catch (err) {
           console.warn('[Server] LLM check failed, using Harper fallback:', err.message);
         }
       }
 
-      const result = await harper.check(text);
-      return sendJson(res, 200, { ...result, engine: 'harper' });
+      try {
+        const result = await harper.check(text);
+        return sendJson(res, 200, { ...result, engine: 'harper' });
+      } catch (hErr) {
+        console.error('[Server] Both LLM and Harper failed:', hErr);
+        return sendJson(res, 503, { error: 'Grammar checking service currently unavailable' });
+      }
     }
 
     if (req.method === 'POST' && pathname === '/paraphrase') {
@@ -603,7 +663,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/correct-all') {
-      const { text, mode } = await parseJsonBody(req); // mode: 'grammar' | 'paraphrase' | 'humanize'
+      const { text, mode } = await parseJsonBody(req);
       if (!text || !text.trim()) {
         return sendJson(res, 400, { error: 'Text is required' });
       }
@@ -611,12 +671,21 @@ const server = http.createServer(async (req, res) => {
       let grammarResult;
       try {
         grammarResult = await harper.check(text);
-      } catch (e) {
-        grammarResult = { correctedText: text, lints: [] };
+      } catch (hErr) {
+        console.warn('[Server] Harper failed in correct-all, attempting LLM grammar fix:', hErr.message);
+        try {
+          const corrected = await llama.generate(PROMPT_GRAMMAR, text);
+          grammarResult = {
+            text,
+            correctedText: corrected,
+            lints: extractWordDiffs(text, corrected)
+          };
+        } catch (llmErr) {
+          throw new Error('All grammar engines failed: ' + llmErr.message);
+        }
       }
 
       let finalResult = grammarResult.correctedText;
-
       if (mode === 'paraphrase') {
         finalResult = await llama.generate(PROMPT_PARAPHRASE, grammarResult.correctedText);
       } else if (mode === 'humanize') {
@@ -634,8 +703,11 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 404, { error: `Endpoint not found: ${pathname}` });
   } catch (err) {
-    console.error(`[Server] Error processing ${req.method} ${pathname}:`, err);
-    sendJson(res, 500, { error: err.message || 'Internal Server Error' });
+    const statusCode = err.statusCode || 500;
+    if (statusCode >= 500) {
+      console.error(`[Server] Error processing ${req.method} ${pathname}:`, err);
+    }
+    sendJson(res, statusCode, { error: err.message || 'Internal Server Error' });
   }
 });
 
@@ -644,24 +716,24 @@ function gracefulShutdown() {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log('[Engine] Graceful shutdown initiated...');
-
   try {
     llama.unload();
-  } catch (e) {
-    console.warn('[Engine] Error unloading LLM on shutdown:', e.message);
-  }
+  } catch (e) {}
 
   server.close(() => {
     console.log('[Engine] HTTP server closed.');
     process.exit(0);
   });
-
-  // Force exit after 2.5s if connections linger
-  setTimeout(() => process.exit(0), 2500);
+  setTimeout(() => process.exit(0), 1500);
 }
 
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
+process.on('exit', () => {
+  try {
+    llama.unload();
+  } catch (e) {}
+});
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[Engine] Words Service listening on http://127.0.0.1:${PORT}`);
