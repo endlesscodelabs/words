@@ -1,5 +1,5 @@
 # Words Desktop Writing Assistant
-# Python dependencies
+# Pinned Python dependencies
 
-pywebview>=5.0.0,<=6.2.1
-pythonnet>=3.0.0,<=3.2.1
+pywebview==6.2.1
+pythonnet==3.2.1
