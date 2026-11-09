@@ -1,0 +1,29 @@
+{
+  "name": "words-engine",
+  "version": "1.0.0",
+  "description": "Offline grammar, paraphrase, and humanizer engine using Harper WASM and llama.cpp",
+  "main": "server.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs",
+    "test": "node --check server.mjs"
+  },
+  "keywords": [
+    "grammar",
+    "spelling",
+    "offline",
+    "harper",
+    "wasm",
+    "llama-cpp",
+    "llm"
+  ],
+  "author": "Narayan Chakraborty",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "harper.js": "^3.0.0"
+  }
+}
